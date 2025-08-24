@@ -14,14 +14,15 @@ from sklearn.preprocessing import StandardScaler
 # Config paths
 # =========================
 BASE_KABKOTA_CSV = "data/base_kabkota.csv"
-INCIDENCE_CSV = "data/incidence_dummy_weekly.csv"   # << precomputed dummy table
+INCIDENCE_CSV = "data/incidence_dummy_weekly.csv"
+WEATHER_WEEKLY_CSV = "data/weather_weekly_agg.csv"   # built by tools/build_weather_weekly.py
 GEOCODE_CACHE = "data/geocode_cache.csv"
 OPEN_METEO_FC = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEO = "https://geocoding-api.open-meteo.com/v1/search"
 HORIZON_DAYS = 7  # fixed 7-day horizon
 
-st.set_page_config(page_title="SIGER-DBD – Open‑Meteo (7 Hari) + Insidensi CSV", layout="wide")
-st.title("SIGER-DBD – Prediksi Risiko (Open‑Meteo 7 Hari + Insidensi dari CSV)")
+st.set_page_config(page_title="SIGER-DBD – Early-Fusion RF (7 Hari)", layout="wide")
+st.title("SIGER-DBD – Random Forest Early‑Fusion (Historis + Cuaca Mingguan)")
 
 # =========================
 # Name normalization & aliases (DKI)
@@ -35,7 +36,6 @@ ALIASES = {
     "KOTA ADM. JAKARTA SELATAN": "Jakarta Selatan",
     "KOTA ADM. JAKARTA TIMUR": "Jakarta Timur",
 }
-
 def _normalize_name(txt: str) -> str:
     if not txt: return ""
     t = re.sub(r"[^A-Za-z0-9\s\.]", " ", txt.upper())
@@ -49,7 +49,7 @@ def _normalize_name(txt: str) -> str:
     return t.title()
 
 # =========================
-# Base loaders
+# Loaders
 # =========================
 def load_base_kabkota(path=BASE_KABKOTA_CSV) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str)
@@ -74,10 +74,7 @@ def load_geocode_cache(path=GEOCODE_CACHE) -> pd.DataFrame:
 def save_geocode_cache(df_cache: pd.DataFrame, path=GEOCODE_CACHE):
     df_cache.to_csv(path, index=False)
 
-# =========================
-# Incidence CSV loader
-# =========================
-def load_incidence_csv(csv_path: str, kabkota_code: str, take_last_weeks: int = 52) -> pd.DataFrame:
+def load_incidence_csv(csv_path: str, kabkota_code: str) -> pd.DataFrame:
     try:
         df_all = pd.read_csv(csv_path, dtype={"kabkota_code": str, "kabkota_name": str})
     except Exception:
@@ -86,21 +83,29 @@ def load_incidence_csv(csv_path: str, kabkota_code: str, take_last_weeks: int = 
     if df.empty:
         return df
     df["week_start_date"] = pd.to_datetime(df["week_start_date"])
-    df = df.sort_values("week_start_date")
-    return df.tail(take_last_weeks).reset_index(drop=True)
+    return df.sort_values("week_start_date").reset_index(drop=True)
+
+def load_weather_weekly(csv_path: str, kabkota_code: str) -> pd.DataFrame:
+    try:
+        df_all = pd.read_csv(csv_path, dtype={"kabkota_code": str, "kabkota_name": str}, parse_dates=["week_start_date"])
+    except Exception:
+        return pd.DataFrame()
+    df = df_all[df_all["kabkota_code"].astype(str) == str(kabkota_code)].copy()
+    if df.empty:
+        return df
+    # expected feature cols: t_mean,t_min,t_max,hu_mean,ws_mean,tcc_mean,rain_hours,rain_frac,hours
+    return df.sort_values("week_start_date").reset_index(drop=True)
 
 # =========================
-# Geocoding & Forecast
+# Geocoding & Forecast (for 7d ahead features)
 # =========================
 @st.cache_data(ttl=6*60*60, show_spinner=False)
 def geocode_open_meteo(place_variants: list[str]):
     cache = load_geocode_cache()
-    # cache hit
     for p in place_variants:
         hit = cache[cache["place"] == p]
         if not hit.empty:
             return float(hit.iloc[0]["lat"]), float(hit.iloc[0]["lon"]), f"cache:{p}"
-    # query
     for p in place_variants:
         params = {"name": p, "count": 1, "language": "id", "format": "json"}
         try:
@@ -124,7 +129,6 @@ def fetch_open_meteo_hourly(lat: float, lon: float, tz: str, days: int = HORIZON
         "hourly": "temperature_2m,relative_humidity_2m,precipitation,cloud_cover,wind_speed_10m",
         "forecast_days": int(days),
         "timezone": tz or "Asia/Jakarta"
-        # "wind_speed_unit": "ms"  # uncomment if you prefer m/s
     }
     r = requests.get(OPEN_METEO_FC, params=params, timeout=30, headers={"User-Agent":"SIGER-DBD/streamlit"})
     r.raise_for_status()
@@ -134,36 +138,34 @@ def fetch_open_meteo_hourly(lat: float, lon: float, tz: str, days: int = HORIZON
         return pd.DataFrame()
     df = pd.DataFrame({
         "local_datetime": pd.to_datetime(h["time"]),
-        "t": h.get("temperature_2m"),
-        "hu": h.get("relative_humidity_2m"),
-        "ws": h.get("wind_speed_10m"),
-        "tcc": h.get("cloud_cover"),
-        "precip": h.get("precipitation"),
+        "temperature_2m": h.get("temperature_2m"),
+        "relative_humidity_2m": h.get("relative_humidity_2m"),
+        "wind_speed_10m": h.get("wind_speed_10m"),
+        "cloud_cover": h.get("cloud_cover"),
+        "precipitation": h.get("precipitation"),
     })
-    df["weather_desc"] = df["precip"].apply(lambda x: "Hujan" if (x or 0) > 0 else "Berawan/Cerah")
     return df
 
-def summarize_open_meteo_7d(df_hourly: pd.DataFrame) -> pd.DataFrame:
+def summarize_7d_like_weekly(df_hourly: pd.DataFrame) -> pd.DataFrame:
     if df_hourly.empty:
         return pd.DataFrame()
-    days = HORIZON_DAYS
-    df = df_hourly.copy()
-    df["is_rain"] = (df["precip"].fillna(0) > 0).astype(int)
+    d = df_hourly.copy()
+    d["is_rain"] = (d["precipitation"].fillna(0) > 0).astype(int)
     out = pd.DataFrame({
-        "t_mean_7d": [np.nanmean(df["t"])],
-        "t_min_7d": [np.nanmin(df["t"])],
-        "t_max_7d": [np.nanmax(df["t"])],
-        "hu_mean_7d": [np.nanmean(df["hu"])],
-        "ws_mean_7d": [np.nanmean(df["ws"])],
-        "tcc_mean_7d": [np.nanmean(df["tcc"])],
-        "rain_slots_7d": [df["is_rain"].sum()],
-        "window_hours": [days * 24],
-        "rain_frac": [float(df["is_rain"].sum()) / float(days*24)]
+        "t_mean": [np.nanmean(d["temperature_2m"])],
+        "t_min": [np.nanmin(d["temperature_2m"])],
+        "t_max": [np.nanmax(d["temperature_2m"])],
+        "hu_mean": [np.nanmean(d["relative_humidity_2m"])],
+        "ws_mean": [np.nanmean(d["wind_speed_10m"])],
+        "tcc_mean": [np.nanmean(d["cloud_cover"])],
+        "rain_hours": [int(d["is_rain"].sum())],
+        "rain_frac": [float(d["is_rain"].sum()) / float(len(d)) if len(d) else 0.0],
+        "hours": [int(len(d))]
     })
     return out
 
 # =========================
-# Incidence features & model (robust)
+# Feature engineering & model
 # =========================
 def build_lag_features(df_inc: pd.DataFrame, max_lag=4) -> pd.DataFrame:
     df = df_inc.sort_values("week_start_date").copy()
@@ -172,57 +174,64 @@ def build_lag_features(df_inc: pd.DataFrame, max_lag=4) -> pd.DataFrame:
         df[f"outbreak_lag{L}"] = df["outbreak"].shift(L)
     return df
 
-def incidence_model_proba(df_inc_with_lag: pd.DataFrame) -> float:
-    df = df_inc_with_lag.dropna().copy()
-    if df.shape[0] < 10:
-        return 0.5
-    train = df.iloc[:-1].copy()
-    test = df.iloc[-1:].copy()
-    feat_cols = [c for c in df.columns if c.startswith("incidence_per_100k_lag")] + \
-                [c for c in df.columns if c.startswith("outbreak_lag")]
-    X_tr = train[feat_cols]
-    y_tr = train["outbreak"].astype(int)
-    X_te = test[feat_cols]
+def merge_hist_inc_weather(df_inc: pd.DataFrame, df_wx: pd.DataFrame) -> pd.DataFrame:
+    if df_inc.empty or df_wx.empty:
+        return pd.DataFrame()
+    df = pd.merge(df_inc, df_wx, on=["kabkota_code","kabkota_name","week_start_date"], how="inner")
+    df = build_lag_features(df, max_lag=4)
+    df = df.dropna().reset_index(drop=True)
+    return df
 
-    # Handle single-class training safely
-    if y_tr.nunique() < 2:
-        return float(y_tr.mean())  # prior probability (0.0..1.0)
-
+def train_rf_earlyfusion(df_hist: pd.DataFrame):
+    if df_hist.empty or df_hist.shape[0] < 16:
+        return None, None
+    feat_cols = [c for c in df_hist.columns if c.startswith("incidence_per_100k_lag")] + \
+                [c for c in df_hist.columns if c.startswith("outbreak_lag")] + \
+                ["t_mean","hu_mean","ws_mean","tcc_mean","rain_frac"]
+    feat_cols = [c for c in feat_cols if c in df_hist.columns]
+    X = df_hist[feat_cols]
+    y = df_hist["outbreak"].astype(int)
+    if y.nunique() < 2:
+        return ("PRIOR", float(y.mean())), feat_cols
     pipe = Pipeline([
         ("sc", StandardScaler()),
         ("rf", RandomForestClassifier(
-            n_estimators=400, min_samples_split=4,
-            class_weight="balanced", random_state=42
+            n_estimators=500, min_samples_split=4,
+            class_weight="balanced_subsample",
+            random_state=42
         ))
     ])
-    pipe.fit(X_tr, y_tr)
-    proba = pipe.predict_proba(X_te)
-    classes_ = list(pipe.named_steps["rf"].classes_)
+    pipe.fit(X, y)
+    return pipe, feat_cols
+
+def predict_proba_with_model(model, feat_cols, df_featrow: pd.DataFrame) -> float:
+    if model is None:
+        return 0.5
+    if isinstance(model, tuple) and model[0] == "PRIOR":
+        return float(model[1])
+    X = df_featrow.reindex(columns=feat_cols, fill_value=np.nan)
+    if X.isna().any().any():
+        return 0.5
+    proba = model.predict_proba(X)
+    classes_ = list(model.named_steps["rf"].classes_)
     if 1 in classes_:
         idx = classes_.index(1)
         return float(proba[:, idx][0])
-    else:
-        return 0.0
-
-def weather_score(df_feats: pd.DataFrame) -> float:
-    if df_feats.empty:
-        return 0.5
-    r = df_feats.iloc[0]
-    t = float(r.get("t_mean_7d")) if pd.notna(r.get("t_mean_7d")) else 30.0
-    rh = float(r.get("hu_mean_7d")) if pd.notna(r.get("hu_mean_7d")) else 85.0
-    rain_frac = float(r.get("rain_frac")) if pd.notna(r.get("rain_frac")) else 0.0
-    s_t = min(max((t - 24.0) / (34.0 - 24.0), 0.0), 1.0)
-    s_rh = min(max((rh - 60.0) / (95.0 - 60.0), 0.0), 1.0)
-    s_rain = min(max(rain_frac, 0.0), 1.0)
-    return round(0.4*s_t + 0.35*s_rh + 0.25*s_rain, 3)
-
-def fused_risk_score(weather_s: float, hist_proba: float, w_cuaca=0.4, w_hist=0.6) -> float:
-    return round(w_cuaca*weather_s + w_hist*hist_proba, 3)
+    return 0.0
 
 def risk_label_from_score(score: float) -> str:
     if score >= 0.66: return "High"
     if score >= 0.33: return "Medium"
     return "Low"
+
+def risk_badge(label: str) -> str:
+    colors = {
+        "High":   ("#e53935", "#fff"),
+        "Medium": ("#fdd835", "#000"),
+        "Low":    ("#43a047", "#fff"),
+    }
+    bg, fg = colors.get(label, ("#999","#fff"))
+    return '<span style="display:inline-block;padding:6px 12px;border-radius:999px;background:%s;color:%s;font-weight:700;">%s</span>' % (bg, fg, label)
 
 # =========================
 # UI
@@ -244,20 +253,45 @@ kabkota_code, kabkota_name = sel_kab["kabkota_code"], sel_kab["kabkota_name"]
 lat_override = sel_kab.get("lat")
 lon_override = sel_kab.get("lon")
 
-st.write(f"📍 **Provinsi**: {prov_name} (`{prov_code}`)  \n🏙️ **Kab/Kota**: {kabkota_name} (`{kabkota_code}`)  \n🗓️ **Horizon**: **{HORIZON_DAYS} hari (tetap)**")
+st.write(f"📍 **Provinsi**: {prov_name} (`{prov_code}`)  \n🏙️ **Kab/Kota**: {kabkota_name} (`{kabkota_code}`)  \n🗓️ **Horizon Prediksi**: **{HORIZON_DAYS} hari ke depan**")
 
-# ===== Weather (7d) =====
-st.subheader("1) Cuaca (Hourly) – Open‑Meteo, 7 hari")
+# ===== Load historical datasets =====
+st.subheader("0) Data Historis (Insidensi + Cuaca Mingguan)")
+df_inc_all = load_incidence_csv(INCIDENCE_CSV, kabkota_code)
+df_wx_all  = load_weather_weekly(WEATHER_WEEKLY_CSV, kabkota_code)
 
-# 1) Use lat/lon override if provided
+c0a, c0b = st.columns(2)
+with c0a:
+    st.write("Insidensi (52 mgr terakhir, preview):")
+    st.dataframe(df_inc_all.tail(10))
+with c0b:
+    st.write("Cuaca Mingguan (preview):")
+    st.dataframe(df_wx_all.tail(10))
+
+df_hist = merge_hist_inc_weather(df_inc_all, df_wx_all)
+if df_hist.empty:
+    st.error("Tidak ada irisan minggu antara insidensi & cuaca mingguan. Pastikan kamu sudah membangun `data/weather_weekly_agg.csv` dengan tools dan rentangnya mencakup minggu-minggu insidensi.")
+    st.stop()
+
+st.info(f"Hist rows: {len(df_hist)} (setelah lag),  Positive (outbreak=1): {int(df_hist['outbreak'].sum())}  |  Negative: {len(df_hist)-int(df_hist['outbreak'].sum())}")
+
+# ===== Train early-fusion RF =====
+st.subheader("1) Model Early‑Fusion (RF)")
+model, feat_cols = train_rf_earlyfusion(df_hist)
+if model is None:
+    st.error("Data historis terlalu sedikit untuk melatih model.")
+    st.stop()
+st.write(f"Fitur yang dipakai: {', '.join(feat_cols)}")
+
+# ===== Forecast 7d → weekly-like features =====
+st.subheader("2) Cuaca 7 Hari ke Depan → Fitur Mingguan")
+# lat/lon source
 lat, lon, source = None, None, None
 if pd.notna(lat_override) and pd.notna(lon_override):
     try:
         lat = float(lat_override); lon = float(lon_override); source = "csv"
     except Exception:
         lat, lon, source = None, None, None
-
-# 2) Otherwise try multiple geocoding variants
 if lat is None or lon is None:
     kab_norm = _normalize_name(kabkota_name)
     prov_norm = _normalize_name(prov_name)
@@ -269,9 +303,9 @@ if lat is None or lon is None:
     ]
     lat, lon, source = geocode_open_meteo(candidates)
 
-st.write(f"Geocoding: **{kabkota_name}**, {prov_name} → lat={lat}, lon={lon} (source: {source})")
+st.write(f"Koordinat: lat={lat}, lon={lon} (source: {source})")
 if lat is None:
-    st.error("Lokasi tidak ditemukan oleh geocoding Open-Meteo. Tambahkan kolom lat,lon di data/base_kabkota.csv atau perbaiki nama.")
+    st.error("Lokasi tidak ditemukan. Tambahkan lat,lon di base_kabkota.csv.")
     st.stop()
 
 @st.cache_data(ttl=2*60*60, show_spinner=False)
@@ -284,73 +318,38 @@ if df_hourly.empty:
     st.stop()
 st.dataframe(df_hourly.head(24))
 
-st.subheader("2) Fitur Ringkas 7‑Hari (Kab/Kota)")
-df_kab_wx = summarize_open_meteo_7d(df_hourly)
-st.dataframe(df_kab_wx)
+df_future_wx = summarize_7d_like_weekly(df_hourly)
+st.write("Ringkasan 7‑hari (format mingguan):")
+st.dataframe(df_future_wx)
 
-# ===== Incidence + Model =====
-st.subheader("3) Riwayat Insidensi (52 minggu — dibaca dari CSV)")
-df_inc = load_incidence_csv(INCIDENCE_CSV, kabkota_code, take_last_weeks=52)
-if df_inc.empty:
-    st.warning("CSV insidensi tidak ditemukan / tidak berisi kab/kota ini. App akan membuat dummy 52 minggu sementara.")
-    # fallback
-    from math import ceil
-    def seed_from_text(txt: str) -> int:
-        import hashlib
-        h = hashlib.sha256(str(txt).encode("utf-8")).hexdigest()
-        return int(h[:8], 16)
-    rng = np.random.default_rng(seed_from_text(kabkota_code))
-    pop = int(rng.integers(150_000, 2_500_000))
-    # simple fallback 52w
-    today = date.today()
-    last_monday = today - timedelta(days=today.weekday())
-    weeks = [last_monday - timedelta(weeks=i) for i in range(1, 53)]
-    weeks = sorted(weeks)
-    rows = []
-    for i, wk in enumerate(weeks):
-        lam = max(1.0, 12 + rng.normal(0, 3))
-        cases = int(rng.poisson(lam))
-        inc = (cases / pop) * 100000.0
-        label = "unsafe" if inc*4.0 > 10.0 else ("moderately_safe" if inc*4.0 >= 3.0 else "safe")
-        rows.append({"kabkota_code": kabkota_code, "kabkota_name": kabkota_name,
-                     "week_start_date": wk, "cases": cases, "population": pop,
-                     "incidence_per_100k": round(inc,4), "risk_label": label, "outbreak": 1 if label=="unsafe" else 0})
-    df_inc = pd.DataFrame(rows)
+# ===== Build last row with lags + future weather for inference =====
+st.subheader("3) Prediksi Risiko Outbreak (Minggu Mendatang)")
+last_hist = df_hist.iloc[[-1]].copy()
+wx_cols = ["t_mean","t_min","t_max","hu_mean","ws_mean","tcc_mean","rain_frac","rain_hours","hours"]
+for c in wx_cols:
+    if c in last_hist.columns:
+        last_hist = last_hist.drop(columns=[c])
+feat_row = pd.concat([last_hist.reset_index(drop=True), df_future_wx.reset_index(drop=True)], axis=1)
 
-st.dataframe(df_inc.tail(10))
+proba = predict_proba_with_model(model, feat_cols, feat_row)
+label = risk_label_from_score(proba)
 
-st.subheader("4) Model Historis (RF lag 1..4)")
-def build_lag_and_model(df_inc):
-    df_lag = build_lag_features(df_inc, max_lag=4)
-    proba = incidence_model_proba(df_lag)
-    return df_lag, proba
+c1, c2 = st.columns(2)
+with c1:
+    st.metric("Probabilitas Outbreak (RF Early‑Fusion)", f"{proba:.2f}")
+with c2:
+    st.markdown(risk_badge(label), unsafe_allow_html=True)
 
-df_lag, hist_proba = build_lag_and_model(df_inc)
-st.write(f"🧪 Probabilitas outbreak (historis): **{hist_proba:.3f}**")
+st.caption("Threshold label: Low <0.33 ≤ Medium <0.66 ≤ High")
 
-st.subheader("5) Skor Cuaca & Fusi")
-wx_score = weather_score(df_kab_wx)
-w_cuaca = st.slider("Bobot Cuaca", 0.0, 1.0, 0.4, 0.05)
-w_hist = 1.0 - w_cuaca
-final_score = fused_risk_score(wx_score, hist_proba, w_cuaca=w_cuaca, w_hist=w_hist)
-label = risk_label_from_score(final_score)
-
-c1, c2, c3 = st.columns(3)
-with c1: st.metric("Prob. Outbreak (Historis)", f"{hist_proba:.2f}")
-with c2: st.metric("Skor Cuaca (0–1)", f"{wx_score:.2f}")
-with c3: st.metric("Risk Score (Final)", f"{final_score:.2f}")
-st.success(f"Kategori Risiko: **{label}**")
-
-# Optional: export current summary
-if st.button("💾 Export ringkasan CSV"):
-    out = df_kab_wx.copy()
+# ===== Optional export =====
+if st.button("💾 Export ringkasan prediksi (CSV)"):
+    out = df_future_wx.copy()
     out.insert(0, "kabkota_code", kabkota_code)
     out.insert(1, "kabkota_name", kabkota_name)
-    out["hist_proba"] = hist_proba
-    out["wx_score"] = wx_score
-    out["final_score"] = final_score
+    out["rf_proba"] = proba
     out["risk_label"] = label
-    out.to_csv("outputs_summary.csv", index=False, encoding="utf-8")
-    st.success("Tersimpan: outputs_summary.csv (di root app)")
+    out.to_csv("outputs_prediction_earlyfusion.csv", index=False, encoding="utf-8")
+    st.success("Tersimpan: outputs_prediction_earlyfusion.csv (root app)")
 
-st.caption("Sumber cuaca: Open‑Meteo. Insidensi: dibaca dari data/incidence_dummy_weekly.csv (precomputed). Geocoding dicache ke data/geocode_cache.csv.")
+st.caption("Mode: Early‑Fusion RF (insidensi + cuaca mingguan historis). Cuaca 7 hari ke depan dipetakan ke format mingguan untuk inferensi.")
