@@ -1,5 +1,6 @@
 
 import os
+import re
 from datetime import date, timedelta
 import pandas as pd
 import numpy as np
@@ -18,11 +19,24 @@ HORIZON_DAYS = 7  # fixed 7-day horizon
 st.set_page_config(page_title="SIGER-DBD – Open‑Meteo (7 Hari) + Incidence", layout="wide")
 st.title("SIGER-DBD – Prediksi Risiko (Open‑Meteo 7 Hari + Riwayat Insidensi)")
 
+ALIASES = {
+    "KAB. ADM. KEP. SERIBU": "Kepulauan Seribu",
+    "KAB ADM KEP SERIBU": "Kepulauan Seribu",
+    "KOTA ADM. JAKARTA PUSAT": "Jakarta Pusat",
+    "KOTA ADM. JAKARTA UTARA": "Jakarta Utara",
+    "KOTA ADM. JAKARTA BARAT": "Jakarta Barat",
+    "KOTA ADM. JAKARTA SELATAN": "Jakarta Selatan",
+    "KOTA ADM. JAKARTA TIMUR": "Jakarta Timur",
+}
+
 def load_base_kabkota(path=BASE_KABKOTA_CSV) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str)
     for c in ["prov_code","prov_name","kabkota_code","kabkota_name"]:
         if c not in df.columns:
             raise ValueError(f"Kolom '{c}' wajib ada di {path}.")
+    # optional lat/lon
+    if "lat" not in df.columns: df["lat"] = np.nan
+    if "lon" not in df.columns: df["lon"] = np.nan
     return df.assign(
         prov_code=lambda d: d["prov_code"].str.strip(),
         prov_name=lambda d: d["prov_name"].str.strip(),
@@ -39,23 +53,45 @@ def load_geocode_cache(path=GEOCODE_CACHE) -> pd.DataFrame:
 def save_geocode_cache(df_cache: pd.DataFrame, path=GEOCODE_CACHE):
     df_cache.to_csv(path, index=False)
 
+def _normalize_name(txt: str) -> str:
+    if not txt: return ""
+    t = re.sub(r"[^A-Za-z0-9\s\.]", " ", txt.upper())
+    t = re.sub(r"\s+", " ", t).strip()
+    # apply aliases exact
+    if t in ALIASES:
+        return ALIASES[t]
+    # generic expansions
+    t = t.replace("KAB. ", "KABUPATEN ").replace("KOTA ADM. ", "KOTA ")
+    t = t.replace("ADM ", "").replace(" KEP ", " KEPULAUAN ")
+    t = t.replace(" KEP. ", " KEPULAUAN ")
+    t = re.sub(r"\s+", " ", t).strip()
+    # title case
+    return t.title()
+
 @st.cache_data(ttl=6*60*60, show_spinner=False)
-def geocode_open_meteo(place: str):
+def geocode_open_meteo(place_variants: list[str]):
+    # 1) cache check for any variant
     cache = load_geocode_cache()
-    got = cache[cache["place"] == place]
-    if not got.empty:
-        return float(got.iloc[0]["lat"]), float(got.iloc[0]["lon"]), "cache"
-    params = {"name": place, "count": 1, "language": "id", "format": "json"}
-    r = requests.get(OPEN_METEO_GEO, params=params, timeout=20, headers={"User-Agent":"SIGER-DBD/streamlit"})
-    r.raise_for_status()
-    j = r.json()
-    if not j.get("results"):
-        return None, None, "not_found"
-    res = j["results"][0]
-    lat, lon = float(res["latitude"]), float(res["longitude"])
-    cache = pd.concat([cache, pd.DataFrame([{"place": place, "lat": lat, "lon": lon}])], ignore_index=True)
-    save_geocode_cache(cache)
-    return lat, lon, "new"
+    for p in place_variants:
+        hit = cache[cache["place"] == p]
+        if not hit.empty:
+            return float(hit.iloc[0]["lat"]), float(hit.iloc[0]["lon"]), f"cache:{p}"
+    # 2) query each variant in order
+    for p in place_variants:
+        params = {"name": p, "count": 1, "language": "id", "format": "json"}
+        try:
+            r = requests.get(OPEN_METEO_GEO, params=params, timeout=20, headers={"User-Agent":"SIGER-DBD/streamlit"})
+            r.raise_for_status()
+            j = r.json()
+            if j.get("results"):
+                res = j["results"][0]
+                lat, lon = float(res["latitude"]), float(res["longitude"])
+                cache = pd.concat([cache, pd.DataFrame([{"place": p, "lat": lat, "lon": lon}])], ignore_index=True)
+                save_geocode_cache(cache)
+                return lat, lon, f"new:{p}"
+        except Exception:
+            continue
+    return None, None, "not_found"
 
 @st.cache_data(ttl=2*60*60, show_spinner=False)
 def fetch_open_meteo_hourly(lat: float, lon: float, tz: str, days: int = HORIZON_DAYS):
@@ -64,7 +100,6 @@ def fetch_open_meteo_hourly(lat: float, lon: float, tz: str, days: int = HORIZON
         "hourly": "temperature_2m,relative_humidity_2m,precipitation,cloud_cover,wind_speed_10m",
         "forecast_days": int(days),
         "timezone": tz or "Asia/Jakarta"
-        # NOTE: default wind speed unit is km/h; to use m/s add: "wind_speed_unit": "ms"
     }
     r = requests.get(OPEN_METEO_FC, params=params, timeout=30, headers={"User-Agent":"SIGER-DBD/streamlit"})
     r.raise_for_status()
@@ -190,22 +225,47 @@ st.sidebar.header("Pilih Wilayah (Horizon tetap 7 hari)")
 prov_list = df_base[["prov_code","prov_name"]].drop_duplicates().to_dict("records")
 sel_prov = st.sidebar.selectbox("Provinsi", prov_list, format_func=lambda r: f"{r['prov_name']} ({r['prov_code']})")
 prov_code, prov_name = sel_prov["prov_code"], sel_prov["prov_name"]
-kab_list = df_base[df_base["prov_code"] == prov_code][["kabkota_code","kabkota_name"]].drop_duplicates().to_dict("records")
+kab_list = df_base[df_base["prov_code"] == prov_code][["kabkota_code","kabkota_name","lat","lon"]].drop_duplicates().to_dict("records")
 sel_kab = st.sidebar.selectbox("Kabupaten/Kota", kab_list, format_func=lambda r: f"{r['kabkota_name']} ({r['kabkota_code']})")
 kabkota_code, kabkota_name = sel_kab["kabkota_code"], sel_kab["kabkota_name"]
+lat_override = sel_kab.get("lat")
+lon_override = sel_kab.get("lon")
 
 st.write(f"📍 **Provinsi**: {prov_name} (`{prov_code}`)  \n🏙️ **Kab/Kota**: {kabkota_name} (`{kabkota_code}`)  \n🗓️ **Horizon**: **{HORIZON_DAYS} hari (tetap)**")
 
 # ===== Weather (7d) =====
 st.subheader("1) Cuaca (Hourly) – Open‑Meteo, 7 hari")
-place = f"{kabkota_name}, {prov_name}, Indonesia"
-lat, lon, src = geocode_open_meteo(place)
-st.write(f"Geocoding: **{place}** → lat={lat}, lon={lon} (source: {src})")
+
+# 1) Use lat/lon override if provided
+lat, lon, source = None, None, None
+if pd.notna(lat_override) and pd.notna(lon_override):
+    try:
+        lat = float(lat_override); lon = float(lon_override); source = "csv"
+    except Exception:
+        lat, lon, source = None, None, None
+
+# 2) Otherwise try multiple geocoding variants
+if lat is None or lon is None:
+    kab_norm = _normalize_name(kabkota_name)
+    prov_norm = _normalize_name(prov_name)
+    candidates = [
+        f"{kab_norm}, {prov_norm}, Indonesia",
+        f"{kab_norm}, Indonesia",
+        f"{kab_norm}, Jakarta, Indonesia" if prov_norm.upper().startswith("DKI") else f"{kab_norm}, {prov_norm}",
+        kab_norm
+    ]
+    lat, lon, source = geocode_open_meteo(candidates)
+
+st.write(f"Geocoding: **{kabkota_name}**, {prov_name} → lat={lat}, lon={lon} (source: {source})")
 if lat is None:
-    st.error("Lokasi tidak ditemukan oleh geocoding Open-Meteo. Periksa penulisan di base_kabkota.csv.")
+    st.error("Lokasi tidak ditemukan oleh geocoding Open-Meteo. Tambahkan kolom lat,lon di data/base_kabkota.csv atau perbaiki nama.")
     st.stop()
 
-df_hourly = fetch_open_meteo_hourly(lat, lon, tz="Asia/Jakarta", days=HORIZON_DAYS)
+@st.cache_data(ttl=2*60*60, show_spinner=False)
+def get_hourly(lat, lon):
+    return fetch_open_meteo_hourly(lat, lon, tz="Asia/Jakarta", days=HORIZON_DAYS)
+
+df_hourly = get_hourly(lat, lon)
 if df_hourly.empty:
     st.error("Open‑Meteo tidak mengembalikan data untuk lokasi ini.")
     st.stop()
@@ -237,4 +297,4 @@ with c1: st.metric("Prob. Outbreak (Historis)", f"{hist_proba:.2f}")
 with c2: st.metric("Skor Cuaca (0–1)", f"{wx_score:.2f}")
 with c3: st.metric("Risk Score (Final)", f"{final_score:.2f}")
 st.success(f"Kategori Risiko: **{label}**")
-st.caption("Sumber cuaca: Open‑Meteo (hourly hingga 16 hari). Geocoding dicache ke data/geocode_cache.csv.")
+st.caption("Tip: isi kolom lat,lon di data/base_kabkota.csv untuk wilayah yang sulit di-geocode (mis. Kepulauan Seribu).")
