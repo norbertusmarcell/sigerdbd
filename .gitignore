@@ -1,0 +1,8 @@
+# Python & Streamlit
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+
+# OS/editor
+.DS_Store
+.vscode/
