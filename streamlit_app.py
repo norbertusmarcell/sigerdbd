@@ -1,226 +1,330 @@
-import re, os, io, csv, time, json, random
+
+import hashlib
+import math
+import re
+import time
+from datetime import date, timedelta
+from typing import List
+
+import numpy as np
+import pandas as pd
 import requests
 import streamlit as st
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-# ---------- Konfigurasi ----------
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-CSV_BASE = os.path.join(DATA_DIR, "base.csv")
-BMKG_URL = "https://api.bmkg.go.id/publik/prakiraan-cuaca?adm4={adm4}"
-SAMPLE_MAX = 6  # jumlah adm4 yang diambil per kab/kota (hemat kuota)
+# ============================================
+# Config & constants
+# ============================================
+BASE_CSV_PATH = "data/base.csv"  # pastikan file ini ada di repo kamu
+BMKG_BASE = "https://api.bmkg.go.id/publik/prakiraan-cuaca"
+HUJAN = re.compile(r"hujan", re.I)
+FEATURES_WEATHER = ["t_mean_3d","t_min_3d","t_max_3d","hu_mean_3d","ws_mean_3d","tcc_mean_3d","rain_slots_3d"]
 
-# ---------- Util & Loader CSV (robust) ----------
-def _read_first_two_columns(path):
-    """
-    Baca base.csv -> kembalikan list (kode, nama)
-    - autodetect delimiter (',' atau ';')
-    - handle BOM/CRLF
-    - header 'kode,nama' bisa ada/ tidak ada
-    """
+# ============================================
+# Utilities
+# ============================================
+def level_of(code: str) -> int:
+    return code.count(".")
+
+def load_base(path: str = BASE_CSV_PATH) -> pd.DataFrame:
+    df = pd.read_csv(path, dtype={"kode": str, "nama": str})
+    df["kode"] = df["kode"].str.strip()
+    df["nama"] = df["nama"].str.strip()
+    return df
+
+def get_provinces(df_base: pd.DataFrame) -> pd.DataFrame:
+    return df_base[df_base["kode"].apply(level_of) == 0][["kode","nama"]].sort_values("kode")
+
+def get_kabkota_by_prov(df_base: pd.DataFrame, prov_code: str) -> pd.DataFrame:
+    mask = df_base["kode"].str.startswith(prov_code + ".") & (df_base["kode"].apply(level_of) == 1)
+    return df_base[mask][["kode","nama"]].sort_values("kode")
+
+def get_adm4_in_kabkota(df_base: pd.DataFrame, kabkota_code: str) -> pd.DataFrame:
+    mask = df_base["kode"].str.startswith(kabkota_code + ".") & (df_base["kode"].apply(level_of) == 3)
+    return df_base[mask][["kode","nama"]].sort_values("kode")
+
+# ============================================
+# BMKG Open Data client
+# ============================================
+@st.cache_data(ttl=3*60*60, show_spinner=False)
+def fetch_forecast_adm4(adm4: str, timeout=20) -> pd.DataFrame:
+    url = f"{BMKG_BASE}?adm4={adm4}"
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    j = r.json()
     rows = []
-    if not os.path.exists(path):
-        return rows
-    with open(path, "rb") as fb:
-        raw = fb.read()
-    text = raw.decode("utf-8-sig", errors="ignore").replace("\r\n","\n").replace("\r","\n")
-    sio = io.StringIO(text)
+    for loc in j.get("data", []):
+        adm4_code = loc.get("adm4", adm4)
+        for it in loc.get("forecasts", []):
+            rows.append({
+                "adm4": adm4_code,
+                "utc_datetime": it.get("utc_datetime"),
+                "local_datetime": it.get("local_datetime"),
+                "t": it.get("t"),
+                "hu": it.get("hu"),
+                "ws": it.get("ws"),
+                "wd": it.get("wd"),
+                "tcc": it.get("tcc"),
+                "weather_desc": it.get("weather_desc"),
+                "weather_desc_en": it.get("weather_desc_en"),
+            })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["local_datetime"] = pd.to_datetime(df["local_datetime"], errors="coerce")
+        for c in ["t","hu","ws","tcc"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-    sample = text[:2000]
-    try:
-        snif = csv.Sniffer().sniff(sample, delimiters=";,")
-        delimiter = snif.delimiter
-        has_header = csv.Sniffer().has_header(sample)
-    except Exception:
-        delimiter = ","
-        has_header = True
+def fetch_many_forecasts(adm4_codes: List[str]) -> pd.DataFrame:
+    frames = []
+    if len(adm4_codes) == 0:
+        return pd.DataFrame()
+    prog = st.progress(0.0, text="Mengambil data BMKG per-ADM4...")
+    n = len(adm4_codes)
+    for i, code in enumerate(adm4_codes, start=1):
+        try:
+            df = fetch_forecast_adm4(code)
+            if not df.empty:
+                frames.append(df.assign(adm4=code))
+        except Exception as e:
+            st.warning(f"Gagal ADM4 {code}: {e}")
+        prog.progress(i/n, text=f"Ambil ADM4 {i}/{n}")
+        if i % 60 == 0:
+            time.sleep(1.2)  # jaga rate limit 60 req/menit/IP
+    prog.empty()
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
-    rd = csv.reader(sio, delimiter=delimiter)
-    if has_header:
-        next(rd, None)
-
-    for r in rd:
-        if not r: 
-            continue
-        kode = (r[0] if len(r)>0 else "").strip()
-        nama = (r[1] if len(r)>1 else "").strip()
-        if kode and nama:
-            rows.append((kode, nama))
-    return rows
-
-@st.cache_data(show_spinner=False)
-def build_kab_map():
-    """
-    Susun peta kab/kota (NN.NN) -> list ADM4 (NN.NN.NN.NNNN)
-    """
-    rows = _read_first_two_columns(CSV_BASE)
-    RE_KAB  = re.compile(r"^\d{2}\.\d{2}$")
-    RE_ADM4 = re.compile(r"^\d{2}\.\d{2}\.\d{2}\.\d{4}$")
-
-    kab_name, kab_adm4 = {}, {}
-
-    # nama kab/kota
-    for kode, nama in rows:
-        if RE_KAB.match(kode):
-            kab_name[kode] = nama
-            kab_adm4.setdefault(kode, set())
-
-    # kumpulkan adm4
-    for kode, _ in rows:
-        if RE_ADM4.match(kode):
-            parts = kode.split(".")
-            kab = ".".join(parts[:2])
-            kab_adm4.setdefault(kab, set()).add(kode)
-            kab_name.setdefault(kab, f"Kab/Kota {kab}")
-
-    kab_map = {}
-    for kab, s in kab_adm4.items():
-        kab_map[kab] = {
-            "name": kab_name.get(kab, f"Kab/Kota {kab}"),
-            "adm4": sorted(list(s))
-        }
-    return kab_map
-
-# ---------- Ambil cuaca BMKG & ringkas ----------
-def fetch_bmkg(adm4: str):
-    if not adm4:
-        return {"suhu": 30.0, "rh": 85.0, "rain": 60.0}
-    try:
-        r = requests.get(BMKG_URL.format(adm4=adm4), timeout=10)
-        if not r.ok:
-            return {"suhu": 30.0, "rh": 85.0, "rain": 60.0}
-        j = r.json()
-        cuaca = j.get("data", [{}])[0].get("cuaca", [])
-        win = cuaca[:8] if isinstance(cuaca, list) else []
-        temps, rhs, rains_rr, rains_proxy = [], [], [], []
-        for slot in win:
-            t = slot.get("t"); hu = slot.get("hu"); rr = slot.get("rr")
-            if t is not None:
-                try: temps.append(float(t))
-                except: pass
-            if hu is not None:
-                try: rhs.append(float(hu))
-                except: pass
-            if rr is not None:
-                try: rains_rr.append(float(rr))
-                except: pass
-            desc = (slot.get("weather_desc") or "").lower()
-            if any(k in desc for k in ["hujan deras","rain heavy","thunderstorm"]):
-                rains_proxy.append(50.0)
-            elif any(k in desc for k in ["hujan","rain","gerimis","drizzle","shower"]):
-                rains_proxy.append(15.0)
-            else:
-                rains_proxy.append(0.0)
-        def mean(vs): return sum(vs)/len(vs) if vs else None
-        suhu = mean(temps) or 30.0
-        rh = mean(rhs) or 85.0
-        rain = mean(rains_rr) if rains_rr else mean(rains_proxy)
-        rain = max(0.0, (rain or 0.0))
-        return {"suhu": round(suhu,1), "rh": round(min(max(rh,0.0),100.0),1), "rain": round(rain,1)}
-    except Exception:
-        return {"suhu": 30.0, "rh": 85.0, "rain": 60.0}
-
-# ---------- Rule-based (cuaca + insidensi opsional) ----------
-def _score_cuaca(wx):
-    suhu = float(wx.get("suhu", 30.0))
-    rh   = float(wx.get("rh",   85.0))
-    rain = float(wx.get("rain", 60.0))
-
-    if suhu <= 24: suhu_score = 0.2
-    elif suhu >= 35: suhu_score = 0.2
-    elif 27 <= suhu <= 32: suhu_score = 1.0
-    else:
-        if 24 < suhu < 27:
-            suhu_score = 0.2 + (suhu - 24) * (0.8/3.0)
-        else:
-            suhu_score = 1.0 - (suhu - 32) * (0.8/3.0)
-
-    rh_score   = 0.0 if rh < 60 else (0.3 if rh < 75 else 0.6)
-    rain_score = 0.0 if rain < 10 else (0.2 if rain < 50 else 0.6)
-
-    cuaca_score = max(0.0, min(1.0, 0.5*suhu_score + 0.25*rh_score + 0.25*rain_score))
-    return round(cuaca_score, 2)
-
-def _score_insidensi(cases, population):
-    try:
-        cases = float(cases); pop = float(population)
-        ir = (cases / pop) * 100000.0 if pop > 0 else 0.0
-    except:
-        ir = 0.0
-    if ir < 10: ins_score = 0.2
-    elif ir < 50: ins_score = 0.5
-    else: ins_score = 0.85
-    return round(ir,2), round(ins_score,2)
-
-def risk_rule(wx, cases=None, population=None, w_cuaca=0.4, w_ins=0.6):
-    cuaca_s = _score_cuaca(wx)
-    if cases is not None and population is not None:
-        ir, ins_s = _score_insidensi(cases, population)
-    else:
-        ir, ins_s = None, 0.0
-        w_cuaca, w_ins = 1.0, 0.0
-    risk = max(0.0, min(1.0, w_cuaca*cuaca_s + w_ins*ins_s))
-    if risk >= 0.70: kategori = "TINGGI"
-    elif risk >= 0.40: kategori = "SEDANG"
-    else: kategori = "RENDAH"
-    return {
-        "cuaca_score": cuaca_s,
-        "ir": ir,
-        "ins_score": ins_s,
-        "risk": kategori,
-        "risk_value": round(risk,2)
+# ============================================
+# Feature engineering (3-day aggregation)
+# ============================================
+def summarize_3day_slots(df_fc: pd.DataFrame) -> pd.DataFrame:
+    if df_fc.empty:
+        return pd.DataFrame()
+    df = df_fc.copy()
+    df["is_rain"] = df["weather_desc"].fillna("").apply(lambda s: 1 if HUJAN.search(s) else 0)
+    agg_map = {
+        "t": ["mean","min","max"],
+        "hu": ["mean"],
+        "ws": ["mean"],
+        "tcc": ["mean"],
+        "is_rain": ["sum"]
     }
+    g = df.groupby("adm4").agg(agg_map)
+    g.columns = ["_".join([c for c in col if c]) for col in g.columns.values]
+    g = g.reset_index().rename(columns={
+        "t_mean":"t_mean_3d",
+        "t_min":"t_min_3d",
+        "t_max":"t_max_3d",
+        "hu_mean":"hu_mean_3d",
+        "ws_mean":"ws_mean_3d",
+        "tcc_mean":"tcc_mean_3d",
+        "is_rain_sum":"rain_slots_3d"
+    })
+    for c in FEATURES_WEATHER:
+        if c in g.columns:
+            g[c] = pd.to_numeric(g[c], errors="coerce")
+    return g
 
-# ========== UI ==========
-st.set_page_config(page_title="SIGER (Streamlit)", page_icon="🛡️", layout="centered")
-st.title("🛡️ SIGER — DBD Early Warning (Streamlit)")
+def aggregate_adm4_to_kabkota(df_adm4_feats: pd.DataFrame, kabkota_name: str) -> pd.DataFrame:
+    if df_adm4_feats.empty:
+        return pd.DataFrame()
+    num_cols = [c for c in df_adm4_feats.columns if c not in ["adm4"]]
+    out = df_adm4_feats[num_cols].mean(numeric_only=True).to_frame().T
+    out.insert(0, "kabkota", kabkota_name)
+    return out
 
-# Sidebar: input insidensi (opsional)
-with st.sidebar:
-    st.header("📈 Data Insidensi (opsional)")
-    use_ins = st.checkbox("Gabungkan insidensi kasus", value=False)
-    cases = st.number_input("Kasus periode berjalan", min_value=0, value=0, step=1)
-    pop   = st.number_input("Populasi wilayah", min_value=1, value=100000, step=1000)
-    st.caption("Jika tidak dicentang, skor dihitung dari cuaca saja.")
+# ============================================
+# Incidence dummy (weekly) per reference
+# - 52 weeks history
+# - risk label via monthly thresholds converted to weekly (x4)
+# ============================================
+def seed_from_text(txt: str) -> int:
+    h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
 
-# Load data kab/kota
-with st.spinner("Memuat daftar kab/kota dari base.csv ..."):
-    KAB = build_kab_map()
+def generate_dummy_incidence(kabkota_code: str, kabkota_name: str, weeks=52) -> pd.DataFrame:
+    today = date.today()
+    last_monday = today - timedelta(days=today.weekday())
+    week_starts = [last_monday - timedelta(weeks=i) for i in range(1, weeks+1)]
+    week_starts = sorted(week_starts)
 
-if not KAB:
-    st.error("KAB_MAP kosong. Pastikan file data/base.csv ada & berformat 'kode,nama'.")
+    rng = np.random.default_rng(seed_from_text(kabkota_code))
+    pop = int(rng.integers(150_000, 2_500_000))
+    base_lambda = 14 if "KOTA" in kabkota_name.upper() else 10
+
+    rows = []
+    for i, wk in enumerate(week_starts):
+        seasonal = 1.0 + 0.5*np.sin(2*np.pi*(i/52.0))
+        lam = max(1.0, base_lambda * seasonal + rng.normal(0, 2))
+        cases = int(rng.poisson(lam))
+        inc_per_100k = (cases / pop) * 100000.0
+        monthly_equiv = inc_per_100k * 4.0  # weekly -> monthly-equivalent
+        if monthly_equiv < 3.0:
+            label = "safe"
+        elif monthly_equiv <= 10.0:
+            label = "moderately_safe"
+        else:
+            label = "unsafe"
+        rows.append({
+            "kabkota_code": kabkota_code,
+            "kabkota_name": kabkota_name,
+            "week_start_date": wk.isoformat(),
+            "cases": cases,
+            "population": pop,
+            "incidence_per_100k": round(inc_per_100k, 4),
+            "risk_label": label
+        })
+    df = pd.DataFrame(rows)
+    return df
+
+def build_lag_features(df_inc: pd.DataFrame, max_lag=4) -> pd.DataFrame:
+    df = df_inc.sort_values("week_start_date").copy()
+    # outbreak target (per reference: unsafe -> 1, else 0)
+    df["outbreak"] = (df["risk_label"] == "unsafe").astype(int)
+    for L in range(1, max_lag+1):
+        df[f"incidence_per_100k_lag{L}"] = df["incidence_per_100k"].shift(L)
+        df[f"outbreak_lag{L}"] = df["outbreak"].shift(L)
+    return df
+
+# ============================================
+# Weather score (0..1) and fusion with incidence model
+# ============================================
+def weather_score(df_kab_feats: pd.DataFrame) -> float:
+    if df_kab_feats.empty:
+        return 0.5
+    r = df_kab_feats.iloc[0]
+    # scale temp 24-34C, RH 60-95%, rain_slots scaled by 24 slots (3 days * 8 slots)
+    t = float(r.get("t_mean_3d", 30.0) or 30.0)
+    rh = float(r.get("hu_mean_3d", 85.0) or 85.0)
+    rain_slots = float(r.get("rain_slots_3d", 0.0) or 0.0)
+    s_t = min(max((t - 24.0) / (34.0 - 24.0), 0.0), 1.0)
+    s_rh = min(max((rh - 60.0) / (95.0 - 60.0), 0.0), 1.0)
+    s_rain = min(max(rain_slots / 24.0, 0.0), 1.0)
+    return round(0.4*s_t + 0.35*s_rh + 0.25*s_rain, 3)
+
+def incidence_model_proba(df_inc_with_lag: pd.DataFrame) -> float:
+    # Train on history except last row; predict next using latest lags
+    df = df_inc_with_lag.dropna().copy()
+    if df.shape[0] < 10:
+        # not enough data
+        return 0.5
+    train = df.iloc[:-1].copy()
+    test = df.iloc[-1:].copy()
+    feat_cols = [c for c in df.columns if c.startswith("incidence_per_100k_lag")] + \
+                [c for c in df.columns if c.startswith("outbreak_lag")]
+    X_tr = train[feat_cols]
+    y_tr = train["outbreak"].astype(int)
+    X_te = test[feat_cols]
+
+    pipe = Pipeline([
+        ("sc", StandardScaler()),
+        ("rf", RandomForestClassifier(
+            n_estimators=400, min_samples_split=4,
+            class_weight="balanced",
+            random_state=42
+        ))
+    ])
+    pipe.fit(X_tr, y_tr)
+    proba = float(pipe.predict_proba(X_te)[:,1][0])
+    return proba
+
+def fused_risk_score(weather_s: float, hist_proba: float, w_cuaca=0.4, w_hist=0.6) -> float:
+    return round(w_cuaca*weather_s + w_hist*hist_proba, 3)
+
+def risk_label_from_score(score: float) -> str:
+    if score >= 0.66:
+        return "High"
+    if score >= 0.33:
+        return "Medium"
+    return "Low"
+
+# ============================================
+# Streamlit UI
+# ============================================
+st.set_page_config(page_title="SIGER-DBD – BMKG (3 Hari) + Incidence (Ref) dari base.csv", layout="wide")
+st.title("SIGER-DBD – BMKG 3 Hari + Riwayat Insidensi (berdasarkan referensi) – from base.csv")
+st.caption("Data cuaca: © BMKG Open Data (prakiraan 3 hari, slot 3-jam, update 2×/hari). Batas 60 req/menit/IP. Label risiko insidensi mengikuti ambang bulanan (<3 aman, 3–10 sedang, >10 tidak aman) yang diekivalenkan ke mingguan (×4).")
+
+# Load base.csv & selections
+try:
+    df_base = load_base(BASE_CSV_PATH)
+except Exception as e:
+    st.error(f"Tidak bisa membaca {BASE_CSV_PATH}. Pastikan file ada di repo. Error: {e}")
     st.stop()
 
-# Dropdown kab/kota
-kab_opts = [(k, v["name"]) for k, v in sorted(KAB.items())]
-labels = [f"{k} — {name}" for k, name in kab_opts]
-idx = st.selectbox("Pilih Kab/Kota", options=range(len(labels)), format_func=lambda i: labels[i])
+st.sidebar.header("Pilih Wilayah (dari base.csv)")
+provs = get_provinces(df_base)
+default_prov_idx = provs["nama"].tolist().index("DKI JAKARTA") if "DKI JAKARTA" in provs["nama"].tolist() else 0
+prov_name = st.sidebar.selectbox("Provinsi", provs["nama"].tolist(), index=default_prov_idx)
+prov_code = provs.loc[provs["nama"] == prov_name, "kode"].iloc[0]
 
-kab_code, kab_name = kab_opts[idx]
-adm4_list = KAB[kab_code]["adm4"]
-st.write(f"**{kab_name}** • {len(adm4_list)} kel/desa (ADM4)")
+kabkota_df = get_kabkota_by_prov(df_base, prov_code)
+kabkota_name = st.sidebar.selectbox("Kabupaten/Kota", kabkota_df["nama"].tolist())
+kabkota_code = kabkota_df.loc[kabkota_df["nama"] == kabkota_name, "kode"].iloc[0]
 
-# Tombol prediksi
-if st.button("🔮 Prediksi Risiko Kab/Kota"):
-    sample = adm4_list[:SAMPLE_MAX]
-    suhus, rhs, rains, detail = [], [], [], []
-    prog = st.progress(0)
-    for i, a in enumerate(sample):
-        wx = fetch_bmkg(a)
-        suhus.append(wx["suhu"]); rhs.append(wx["rh"]); rains.append(wx["rain"])
-        detail.append({"adm4": a, "cuaca": wx})
-        prog.progress((i+1)/len(sample))
-        time.sleep(0.2)  # sopan ke API
+st.write(f"📍 **Provinsi**: {prov_name} (`{prov_code}`)  \n🏙️ **Kab/Kota**: {kabkota_name} (`{kabkota_code}`)")
 
-    def mean(vs): return round(sum(vs)/len(vs), 2) if vs else None
-    agg = {"suhu": mean(suhus), "rh": mean(rhs), "rain": mean(rains)}
-    rr = risk_rule(agg, cases, pop) if use_ins else risk_rule(agg)
+# ADM4 derivation
+adm4_df = get_adm4_in_kabkota(df_base, kabkota_code)
+total_adm4 = len(adm4_df)
+st.write(f"🔎 Ditemukan **{total_adm4}** ADM4 (kel/desa) di bawah {kabkota_name}.")
 
-    st.subheader("Hasil")
-    st.metric("Risiko", rr["risk"], f"Skor {rr['risk_value']}")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Suhu (°C)", agg["suhu"])
-    col2.metric("RH (%)", agg["rh"])
-    col3.metric("Hujan (mm)", agg["rain"])
-    if use_ins and rr["ir"] is not None:
-        st.caption(f"IR per 100.000 = **{rr['ir']}** (skor {rr['ins_score']})")
-    with st.expander("Rincian sampel ADM4 yang diambil"):
-        st.json(detail)
+max_fetch = st.sidebar.slider("Batas ADM4 yang diambil (hemat kuota)", min_value=10, max_value=max(10, total_adm4 or 10), value=min(100, total_adm4 or 10), step=10)
+adm4_list = adm4_df["kode"].tolist()[:max_fetch]
+
+# Fetch BMKG
+st.subheader("1) Prakiraan Cuaca (3 hari, slot 3-jam)")
+if total_adm4 == 0:
+    st.warning("Tidak ditemukan ADM4 untuk kab/kota ini pada base.csv.")
+    st.stop()
+
+df_fc = fetch_many_forecasts(adm4_list)
+if df_fc.empty:
+    st.error("Tidak ada data prakiraan yang berhasil diambil dari BMKG.")
+    st.stop()
+st.dataframe(df_fc.sort_values("local_datetime"))
+
+# Weather features
+st.subheader("2) Fitur Ringkas 3-Hari (Agregasi ADM4 → Kab/Kota)")
+df_adm4_feats = summarize_3day_slots(df_fc)
+df_kab_wx = aggregate_adm4_to_kabkota(df_adm4_feats, kabkota_name)
+st.dataframe(df_kab_wx)
+
+# Incidence history (dummy if missing)
+st.subheader("3) Riwayat Insidensi (Dummy, 52 minggu ke belakang)")
+df_inc = generate_dummy_incidence(kabkota_code, kabkota_name, weeks=52)
+st.dataframe(df_inc.tail(10))
+
+# Build lags and train RF on history
+st.subheader("4) Model Insidensi Berbasis Riwayat (Random Forest)")
+df_inc_lag = build_lag_features(df_inc, max_lag=4)
+hist_proba = incidence_model_proba(df_inc_lag)
+st.write(f"🧪 Probabilitas outbreak dari **model historis** (berdasarkan lag 1..4): **{hist_proba:.3f}**")
+
+# Weather score
+st.subheader("5) Skor Cuaca (3-hari)")
+wx_score = weather_score(df_kab_wx)
+st.write(f"☁️ Skor cuaca komposit (0–1): **{wx_score:.3f}**  \n*(berdasarkan t_mean_3d, RH, dan rain_slots_3d)*")
+
+# Fusion
+st.subheader("6) Fusi Skor (Cuaca + Historis) → Risiko 3-Hari")
+w_cuaca = st.slider("Bobot Cuaca", min_value=0.0, max_value=1.0, value=0.4, step=0.05)
+w_hist = 1.0 - w_cuaca
+final_score = fused_risk_score(wx_score, hist_proba, w_cuaca=w_cuaca, w_hist=w_hist)
+label = risk_label_from_score(final_score)
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("Prob. Outbreak (Historis)", f"{hist_proba:.2f}")
+with c2:
+    st.metric("Skor Cuaca (0–1)", f"{wx_score:.2f}")
+with c3:
+    st.metric("Risk Score (Final)", f"{final_score:.2f}")
+
+st.success(f"Kategori Risiko: **{label}**")
+st.caption("Catatan: Ambang risiko insidensi menggunakan rujukan bulanan (<3, 3–10, >10 per 100k) yang diekivalensikan ke mingguan (×4). Model historis dilatih pada lag 1..4 minggu. Fusi skor mengikuti bobot yang dapat kamu ubah.")
