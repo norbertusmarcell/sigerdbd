@@ -10,15 +10,22 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+# =========================
+# Config paths
+# =========================
 BASE_KABKOTA_CSV = "data/base_kabkota.csv"
+INCIDENCE_CSV = "data/incidence_dummy_weekly.csv"   # << precomputed dummy table
 GEOCODE_CACHE = "data/geocode_cache.csv"
 OPEN_METEO_FC = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEO = "https://geocoding-api.open-meteo.com/v1/search"
 HORIZON_DAYS = 7  # fixed 7-day horizon
 
-st.set_page_config(page_title="SIGER-DBD – Open‑Meteo (7 Hari) + Incidence", layout="wide")
-st.title("SIGER-DBD – Prediksi Risiko (Open‑Meteo 7 Hari + Riwayat Insidensi)")
+st.set_page_config(page_title="SIGER-DBD – Open‑Meteo (7 Hari) + Insidensi CSV", layout="wide")
+st.title("SIGER-DBD – Prediksi Risiko (Open‑Meteo 7 Hari + Insidensi dari CSV)")
 
+# =========================
+# Name normalization & aliases (DKI)
+# =========================
 ALIASES = {
     "KAB. ADM. KEP. SERIBU": "Kepulauan Seribu",
     "KAB ADM KEP SERIBU": "Kepulauan Seribu",
@@ -29,12 +36,26 @@ ALIASES = {
     "KOTA ADM. JAKARTA TIMUR": "Jakarta Timur",
 }
 
+def _normalize_name(txt: str) -> str:
+    if not txt: return ""
+    t = re.sub(r"[^A-Za-z0-9\s\.]", " ", txt.upper())
+    t = re.sub(r"\s+", " ", t).strip()
+    if t in ALIASES:
+        return ALIASES[t]
+    t = t.replace("KAB. ", "KABUPATEN ").replace("KOTA ADM. ", "KOTA ")
+    t = t.replace("ADM ", "").replace(" KEP ", " KEPULAUAN ")
+    t = t.replace(" KEP. ", " KEPULAUAN ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.title()
+
+# =========================
+# Base loaders
+# =========================
 def load_base_kabkota(path=BASE_KABKOTA_CSV) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str)
     for c in ["prov_code","prov_name","kabkota_code","kabkota_name"]:
         if c not in df.columns:
             raise ValueError(f"Kolom '{c}' wajib ada di {path}.")
-    # optional lat/lon
     if "lat" not in df.columns: df["lat"] = np.nan
     if "lon" not in df.columns: df["lon"] = np.nan
     return df.assign(
@@ -53,30 +74,33 @@ def load_geocode_cache(path=GEOCODE_CACHE) -> pd.DataFrame:
 def save_geocode_cache(df_cache: pd.DataFrame, path=GEOCODE_CACHE):
     df_cache.to_csv(path, index=False)
 
-def _normalize_name(txt: str) -> str:
-    if not txt: return ""
-    t = re.sub(r"[^A-Za-z0-9\s\.]", " ", txt.upper())
-    t = re.sub(r"\s+", " ", t).strip()
-    # apply aliases exact
-    if t in ALIASES:
-        return ALIASES[t]
-    # generic expansions
-    t = t.replace("KAB. ", "KABUPATEN ").replace("KOTA ADM. ", "KOTA ")
-    t = t.replace("ADM ", "").replace(" KEP ", " KEPULAUAN ")
-    t = t.replace(" KEP. ", " KEPULAUAN ")
-    t = re.sub(r"\s+", " ", t).strip()
-    # title case
-    return t.title()
+# =========================
+# Incidence CSV loader
+# =========================
+def load_incidence_csv(csv_path: str, kabkota_code: str, take_last_weeks: int = 52) -> pd.DataFrame:
+    try:
+        df_all = pd.read_csv(csv_path, dtype={"kabkota_code": str, "kabkota_name": str})
+    except Exception:
+        return pd.DataFrame()
+    df = df_all[df_all["kabkota_code"].astype(str) == str(kabkota_code)].copy()
+    if df.empty:
+        return df
+    df["week_start_date"] = pd.to_datetime(df["week_start_date"])
+    df = df.sort_values("week_start_date")
+    return df.tail(take_last_weeks).reset_index(drop=True)
 
+# =========================
+# Geocoding & Forecast
+# =========================
 @st.cache_data(ttl=6*60*60, show_spinner=False)
 def geocode_open_meteo(place_variants: list[str]):
-    # 1) cache check for any variant
     cache = load_geocode_cache()
+    # cache hit
     for p in place_variants:
         hit = cache[cache["place"] == p]
         if not hit.empty:
             return float(hit.iloc[0]["lat"]), float(hit.iloc[0]["lon"]), f"cache:{p}"
-    # 2) query each variant in order
+    # query
     for p in place_variants:
         params = {"name": p, "count": 1, "language": "id", "format": "json"}
         try:
@@ -100,6 +124,7 @@ def fetch_open_meteo_hourly(lat: float, lon: float, tz: str, days: int = HORIZON
         "hourly": "temperature_2m,relative_humidity_2m,precipitation,cloud_cover,wind_speed_10m",
         "forecast_days": int(days),
         "timezone": tz or "Asia/Jakarta"
+        # "wind_speed_unit": "ms"  # uncomment if you prefer m/s
     }
     r = requests.get(OPEN_METEO_FC, params=params, timeout=30, headers={"User-Agent":"SIGER-DBD/streamlit"})
     r.raise_for_status()
@@ -137,51 +162,9 @@ def summarize_open_meteo_7d(df_hourly: pd.DataFrame) -> pd.DataFrame:
     })
     return out
 
-def weather_score(df_feats: pd.DataFrame) -> float:
-    if df_feats.empty:
-        return 0.5
-    r = df_feats.iloc[0]
-    t = float(r.get("t_mean_7d")) if pd.notna(r.get("t_mean_7d")) else 30.0
-    rh = float(r.get("hu_mean_7d")) if pd.notna(r.get("hu_mean_7d")) else 85.0
-    rain_frac = float(r.get("rain_frac")) if pd.notna(r.get("rain_frac")) else 0.0
-    s_t = min(max((t - 24.0) / (34.0 - 24.0), 0.0), 1.0)
-    s_rh = min(max((rh - 60.0) / (95.0 - 60.0), 0.0), 1.0)
-    s_rain = min(max(rain_frac, 0.0), 1.0)
-    return round(0.4*s_t + 0.35*s_rh + 0.25*s_rain, 3)
-
-def seed_from_text(txt: str) -> int:
-    import hashlib
-    h = hashlib.sha256(str(txt).encode("utf-8")).hexdigest()
-    return int(h[:8], 16)
-
-def generate_dummy_incidence(kabkota_code: str, kabkota_name: str, weeks=52) -> pd.DataFrame:
-    today = date.today()
-    last_monday = today - timedelta(days=today.weekday())
-    week_starts = [last_monday - timedelta(weeks=i) for i in range(1, weeks+1)]
-    week_starts = sorted(week_starts)
-    rng = np.random.default_rng(seed_from_text(kabkota_code))
-    pop = int(rng.integers(150_000, 2_500_000))
-    base_lambda = 16 if "KOTA" in kabkota_name.upper() else 12
-    rows = []
-    for i, wk in enumerate(week_starts):
-        seasonal = 1.0 + 0.5*np.sin(2*np.pi*(i/52.0))
-        lam = max(1.0, base_lambda * seasonal + rng.normal(0, 2))
-        cases = int(rng.poisson(lam))
-        inc_per_100k = (cases / pop) * 100000.0
-        monthly_equiv = inc_per_100k * 4.0
-        label = "safe" if monthly_equiv < 3.0 else ("moderately_safe" if monthly_equiv <= 10.0 else "unsafe")
-        rows.append({
-            "kabkota_code": kabkota_code,
-            "kabkota_name": kabkota_name,
-            "week_start_date": wk.isoformat(),
-            "cases": cases,
-            "population": pop,
-            "incidence_per_100k": round(inc_per_100k, 4),
-            "risk_label": label,
-            "outbreak": 1 if label=="unsafe" else 0
-        })
-    return pd.DataFrame(rows)
-
+# =========================
+# Incidence features & model (robust)
+# =========================
 def build_lag_features(df_inc: pd.DataFrame, max_lag=4) -> pd.DataFrame:
     df = df_inc.sort_values("week_start_date").copy()
     for L in range(1, max_lag+1):
@@ -200,11 +183,38 @@ def incidence_model_proba(df_inc_with_lag: pd.DataFrame) -> float:
     X_tr = train[feat_cols]
     y_tr = train["outbreak"].astype(int)
     X_te = test[feat_cols]
-    pipe = Pipeline([("sc", StandardScaler()),
-                     ("rf", RandomForestClassifier(n_estimators=400, min_samples_split=4,
-                                                  class_weight="balanced", random_state=42))])
+
+    # Handle single-class training safely
+    if y_tr.nunique() < 2:
+        return float(y_tr.mean())  # prior probability (0.0..1.0)
+
+    pipe = Pipeline([
+        ("sc", StandardScaler()),
+        ("rf", RandomForestClassifier(
+            n_estimators=400, min_samples_split=4,
+            class_weight="balanced", random_state=42
+        ))
+    ])
     pipe.fit(X_tr, y_tr)
-    return float(pipe.predict_proba(X_te)[:,1][0])
+    proba = pipe.predict_proba(X_te)
+    classes_ = list(pipe.named_steps["rf"].classes_)
+    if 1 in classes_:
+        idx = classes_.index(1)
+        return float(proba[:, idx][0])
+    else:
+        return 0.0
+
+def weather_score(df_feats: pd.DataFrame) -> float:
+    if df_feats.empty:
+        return 0.5
+    r = df_feats.iloc[0]
+    t = float(r.get("t_mean_7d")) if pd.notna(r.get("t_mean_7d")) else 30.0
+    rh = float(r.get("hu_mean_7d")) if pd.notna(r.get("hu_mean_7d")) else 85.0
+    rain_frac = float(r.get("rain_frac")) if pd.notna(r.get("rain_frac")) else 0.0
+    s_t = min(max((t - 24.0) / (34.0 - 24.0), 0.0), 1.0)
+    s_rh = min(max((rh - 60.0) / (95.0 - 60.0), 0.0), 1.0)
+    s_rain = min(max(rain_frac, 0.0), 1.0)
+    return round(0.4*s_t + 0.35*s_rh + 0.25*s_rain, 3)
 
 def fused_risk_score(weather_s: float, hist_proba: float, w_cuaca=0.4, w_hist=0.6) -> float:
     return round(w_cuaca*weather_s + w_hist*hist_proba, 3)
@@ -214,7 +224,9 @@ def risk_label_from_score(score: float) -> str:
     if score >= 0.33: return "Medium"
     return "Low"
 
-# ===== UI selections =====
+# =========================
+# UI
+# =========================
 try:
     df_base = load_base_kabkota(BASE_KABKOTA_CSV)
 except Exception as e:
@@ -225,6 +237,7 @@ st.sidebar.header("Pilih Wilayah (Horizon tetap 7 hari)")
 prov_list = df_base[["prov_code","prov_name"]].drop_duplicates().to_dict("records")
 sel_prov = st.sidebar.selectbox("Provinsi", prov_list, format_func=lambda r: f"{r['prov_name']} ({r['prov_code']})")
 prov_code, prov_name = sel_prov["prov_code"], sel_prov["prov_name"]
+
 kab_list = df_base[df_base["prov_code"] == prov_code][["kabkota_code","kabkota_name","lat","lon"]].drop_duplicates().to_dict("records")
 sel_kab = st.sidebar.selectbox("Kabupaten/Kota", kab_list, format_func=lambda r: f"{r['kabkota_name']} ({r['kabkota_code']})")
 kabkota_code, kabkota_name = sel_kab["kabkota_code"], sel_kab["kabkota_name"]
@@ -276,13 +289,43 @@ df_kab_wx = summarize_open_meteo_7d(df_hourly)
 st.dataframe(df_kab_wx)
 
 # ===== Incidence + Model =====
-st.subheader("3) Riwayat Insidensi (Dummy 52 minggu)")
-df_inc = generate_dummy_incidence(kabkota_code, kabkota_name, weeks=52)
+st.subheader("3) Riwayat Insidensi (52 minggu — dibaca dari CSV)")
+df_inc = load_incidence_csv(INCIDENCE_CSV, kabkota_code, take_last_weeks=52)
+if df_inc.empty:
+    st.warning("CSV insidensi tidak ditemukan / tidak berisi kab/kota ini. App akan membuat dummy 52 minggu sementara.")
+    # fallback
+    from math import ceil
+    def seed_from_text(txt: str) -> int:
+        import hashlib
+        h = hashlib.sha256(str(txt).encode("utf-8")).hexdigest()
+        return int(h[:8], 16)
+    rng = np.random.default_rng(seed_from_text(kabkota_code))
+    pop = int(rng.integers(150_000, 2_500_000))
+    # simple fallback 52w
+    today = date.today()
+    last_monday = today - timedelta(days=today.weekday())
+    weeks = [last_monday - timedelta(weeks=i) for i in range(1, 53)]
+    weeks = sorted(weeks)
+    rows = []
+    for i, wk in enumerate(weeks):
+        lam = max(1.0, 12 + rng.normal(0, 3))
+        cases = int(rng.poisson(lam))
+        inc = (cases / pop) * 100000.0
+        label = "unsafe" if inc*4.0 > 10.0 else ("moderately_safe" if inc*4.0 >= 3.0 else "safe")
+        rows.append({"kabkota_code": kabkota_code, "kabkota_name": kabkota_name,
+                     "week_start_date": wk, "cases": cases, "population": pop,
+                     "incidence_per_100k": round(inc,4), "risk_label": label, "outbreak": 1 if label=="unsafe" else 0})
+    df_inc = pd.DataFrame(rows)
+
 st.dataframe(df_inc.tail(10))
 
 st.subheader("4) Model Historis (RF lag 1..4)")
-df_lag = build_lag_features(df_inc, max_lag=4)
-hist_proba = incidence_model_proba(df_lag)
+def build_lag_and_model(df_inc):
+    df_lag = build_lag_features(df_inc, max_lag=4)
+    proba = incidence_model_proba(df_lag)
+    return df_lag, proba
+
+df_lag, hist_proba = build_lag_and_model(df_inc)
 st.write(f"🧪 Probabilitas outbreak (historis): **{hist_proba:.3f}**")
 
 st.subheader("5) Skor Cuaca & Fusi")
@@ -297,4 +340,17 @@ with c1: st.metric("Prob. Outbreak (Historis)", f"{hist_proba:.2f}")
 with c2: st.metric("Skor Cuaca (0–1)", f"{wx_score:.2f}")
 with c3: st.metric("Risk Score (Final)", f"{final_score:.2f}")
 st.success(f"Kategori Risiko: **{label}**")
-st.caption("Tip: isi kolom lat,lon di data/base_kabkota.csv untuk wilayah yang sulit di-geocode (mis. Kepulauan Seribu).")
+
+# Optional: export current summary
+if st.button("💾 Export ringkasan CSV"):
+    out = df_kab_wx.copy()
+    out.insert(0, "kabkota_code", kabkota_code)
+    out.insert(1, "kabkota_name", kabkota_name)
+    out["hist_proba"] = hist_proba
+    out["wx_score"] = wx_score
+    out["final_score"] = final_score
+    out["risk_label"] = label
+    out.to_csv("outputs_summary.csv", index=False, encoding="utf-8")
+    st.success("Tersimpan: outputs_summary.csv (di root app)")
+
+st.caption("Sumber cuaca: Open‑Meteo. Insidensi: dibaca dari data/incidence_dummy_weekly.csv (precomputed). Geocoding dicache ke data/geocode_cache.csv.")
