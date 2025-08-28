@@ -379,14 +379,12 @@ with c2:
 
 st.caption("Threshold label: Low <0.33 ≤ Medium <0.66 ≤ High")
 
-# ===== Optional export =====
-if st.button("💾 Export ringkasan prediksi (CSV)"):
-    out = df_future_wx.copy()
-    out.insert(0, "kabkota_code", kabkota_code)
-    out.insert(1, "kabkota_name", kabkota_name)
-    out["rf_proba"] = proba
-    out["risk_label"] = label
-    out.to_csv("outputs_prediction_earlyfusion.csv", index=False, encoding="utf-8")
-    st.success("Tersimpan: outputs_prediction_earlyfusion.csv (root app)")
+# ===== Link eksternal =====
+st.subheader("4) Lanjut ke Dashboard Screening")
+st.markdown(
+    "[🔗 Buka Dashboard Screening SIGER-DBD](https://skriningsigerdbd.streamlit.app/)",
+    unsafe_allow_html=True
+)
+
 
 st.caption("Mode: Early-Fusion RF (insidensi + cuaca mingguan historis). Cuaca 7 hari **harian** diringkas ke format mingguan untuk inferensi.")
