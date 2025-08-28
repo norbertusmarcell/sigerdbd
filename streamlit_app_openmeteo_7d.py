@@ -1,3 +1,4 @@
+# app.py
 import os
 import re
 from datetime import date, timedelta
@@ -5,12 +6,15 @@ import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_curve, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 
 # =========================
-# Config paths
+# Config paths & constants
 # =========================
 BASE_KABKOTA_CSV = "data/base_kabkota.csv"
 INCIDENCE_CSV = "data/incidence_dummy_weekly.csv"
@@ -125,7 +129,6 @@ def geocode_open_meteo(place_variants: list[str]):
 def fetch_open_meteo_daily(lat: float, lon: float, tz: str, days: int = HORIZON_DAYS):
     """
     Ambil variabel cuaca harian untuk horizon 7 hari.
-    Beberapa variabel (humidity & cloud) mungkin tidak tersedia di semua lokasi—akan diisi NaN jika tidak ada.
     """
     params = {
         "latitude": lat,
@@ -139,7 +142,7 @@ def fetch_open_meteo_daily(lat: float, lon: float, tz: str, days: int = HORIZON_
             "wind_speed_10m_mean",
             "wind_speed_10m_max",
             "cloud_cover_mean",
-            "relative_humidity_2m_mean",  # jika tidak tersedia, akan kosong/diabaikan API
+            "relative_humidity_2m_mean",  # bisa None jika tidak tersedia
         ]),
         "forecast_days": int(days),
         "timezone": tz or "Asia/Jakarta"
@@ -167,24 +170,17 @@ def fetch_open_meteo_daily(lat: float, lon: float, tz: str, days: int = HORIZON_
 def summarize_7d_from_daily(df_daily: pd.DataFrame) -> pd.DataFrame:
     """
     Ubah 7 baris harian → satu baris ringkasan mingguan:
-    kolom output diselaraskan ke skema historis mingguan:
-    t_mean, t_min, t_max, hu_mean, ws_mean, tcc_mean, rain_hours, rain_frac, hours
+    output kolom: t_mean, t_min, t_max, hu_mean, ws_mean, tcc_mean, rain_hours, rain_frac, hours
     """
     if df_daily.empty:
         return pd.DataFrame()
     d = df_daily.copy()
-
-    # Durasi jam total 7 hari (anggap 24 jam/hari, tanpa missing)
     total_hours = 24 * len(d)
 
-    # Ambil humidity jika tersedia, jika tidak → NaN
-    if "hu_mean_daily" in d.columns:
-        hu = pd.to_numeric(d["hu_mean_daily"], errors="coerce")
-        hu_mean = float(np.nanmean(hu)) if len(hu) else np.nan
-    else:
-        hu_mean = np.nan
+    # humidity bisa tidak tersedia
+    hu = pd.to_numeric(d.get("hu_mean_daily"), errors="coerce")
+    hu_mean = float(np.nanmean(hu)) if hu is not None and len(hu) else np.nan
 
-    # Ringkasan
     out = pd.DataFrame({
         "t_mean": [float(np.nanmean(pd.to_numeric(d["t_mean"], errors="coerce")))],
         "t_min": [float(np.nanmin(pd.to_numeric(d["t_min"], errors="coerce")))],
@@ -253,11 +249,6 @@ def predict_proba_with_model(model, feat_cols, df_featrow: pd.DataFrame) -> floa
         return float(proba[:, idx][0])
     return 0.0
 
-def risk_label_from_score(score: float) -> str:
-    if score >= 0.66: return "High"
-    if score >= 0.33: return "Medium"
-    return "Low"
-
 def risk_badge(label: str) -> str:
     colors = {
         "High":   ("#e53935", "#fff"),
@@ -266,6 +257,90 @@ def risk_badge(label: str) -> str:
     }
     bg, fg = colors.get(label, ("#999","#fff"))
     return '<span style="display:inline-block;padding:6px 12px;border-radius:999px;background:%s;color:%s;font-weight:700;">%s</span>' % (bg, fg, label)
+
+# =========================
+# ROC / Youden per provinsi
+# =========================
+def _get_feat_cols_like_training(df_hist: pd.DataFrame) -> list[str]:
+    feat_cols = [c for c in df_hist.columns if c.startswith("incidence_per_100k_lag")] + \
+                [c for c in df_hist.columns if c.startswith("outbreak_lag")] + \
+                ["t_mean","hu_mean","ws_mean","tcc_mean","rain_frac"]
+    return [c for c in feat_cols if c in df_hist.columns]
+
+def build_hist_dataset_for_province(prov_code: str, df_base_cached: pd.DataFrame) -> pd.DataFrame:
+    kab_list_df = df_base_cached[df_base_cached["prov_code"] == prov_code][["kabkota_code","kabkota_name"]].drop_duplicates()
+    frames = []
+    for _, row in kab_list_df.iterrows():
+        kab_code = row["kabkota_code"]
+        inc = load_incidence_csv(INCIDENCE_CSV, kab_code)
+        wx  = load_weather_weekly(WEATHER_WEEKLY_CSV, kab_code)
+        merged = merge_hist_inc_weather(inc, wx)
+        if not merged.empty:
+            frames.append(merged)
+    if not frames:
+        return pd.DataFrame()
+    df_all = pd.concat(frames, ignore_index=True)\
+              .sort_values(["kabkota_code","week_start_date"])\
+              .reset_index(drop=True)
+    return df_all
+
+def oof_proba_rf(df_hist_all: pd.DataFrame, n_splits: int = 5, seed: int = 42):
+    feat_cols = _get_feat_cols_like_training(df_hist_all)
+    if len(feat_cols) == 0:
+        return None, None, None
+    X = df_hist_all[feat_cols].copy()
+    y = df_hist_all["outbreak"].astype(int).values
+    if pd.isna(X).any().any() or y.ndim != 1 or np.unique(y).size < 2:
+        return None, None, None
+    oof = np.zeros(len(df_hist_all), dtype=float)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for tr_idx, va_idx in skf.split(X, y):
+        pipe = Pipeline([
+            ("sc", StandardScaler()),
+            ("rf", RandomForestClassifier(
+                n_estimators=500, min_samples_split=4,
+                class_weight="balanced_subsample",
+                random_state=seed
+            ))
+        ])
+        pipe.fit(X.iloc[tr_idx], y[tr_idx])
+        proba = pipe.predict_proba(X.iloc[va_idx])[:, 1]
+        oof[va_idx] = proba
+    try:
+        auc = roc_auc_score(y, oof)
+    except Exception:
+        auc = np.nan
+    return oof, y, auc
+
+def youden_threshold(y_true: np.ndarray, proba: np.ndarray):
+    fpr, tpr, thr = roc_curve(y_true, proba)
+    J = tpr - fpr
+    idx = int(np.nanargmax(J))
+    sens = float(tpr[idx])
+    spec = float(1 - fpr[idx])
+    thr_opt = float(thr[idx])
+    return thr_opt, sens, spec
+
+def risk_label_with_prov_threshold(score: float, prov_code: str) -> str:
+    """
+    Pakai threshold hasil ROC-Youden per provinsi jika tersedia.
+    Strategi 3 level sederhana:
+      - High   >= thr
+      - Medium >= 0.5*thr dan < thr
+      - Low    < 0.5*thr
+    Fallback: 0.33/0.66.
+    """
+    info = st.session_state.get("prov_thresholds", {}).get(prov_code)
+    if info and np.isfinite(info.get("threshold", np.nan)):
+        thr = float(info["threshold"])
+        low_med = 0.5 * thr
+        if score >= thr: return "High"
+        if score >= low_med: return "Medium"
+        return "Low"
+    # Fallback default
+    if score >= 0.66: return "High"
+    if score >= 0.33: return "Medium"
+    return "Low"
 
 # =========================
 # UI
@@ -317,10 +392,31 @@ if model is None:
     st.stop()
 st.write(f"Fitur yang dipakai: {', '.join(feat_cols)}")
 
+# ===== ROC-based threshold per provinsi (Youden) =====
+st.subheader("1.a) ROC-based Threshold per Provinsi (Youden’s Index)")
+if "prov_thresholds" not in st.session_state:
+    st.session_state["prov_thresholds"] = {}
+
+if st.button("🔍 Hitung Cut-off ROC (Youden) untuk Provinsi Ini"):
+    df_prov_all = build_hist_dataset_for_province(prov_code, df_base)
+    if df_prov_all.empty or df_prov_all["outbreak"].astype(int).nunique() < 2:
+        st.error("Data historis provinsi ini tidak cukup/kurang variasi label untuk ROC.")
+    else:
+        oof, y_true, auc = oof_proba_rf(df_prov_all, n_splits=5, seed=42)
+        if oof is None:
+            st.error("Gagal menghitung OOF/fitur tidak lengkap (cek missing values).")
+        else:
+            thr, sens, spec = youden_threshold(y_true, oof)
+            st.session_state["prov_thresholds"][prov_code] = {
+                "threshold": thr, "sens": sens, "spec": spec, "auc": auc
+            }
+            st.success(
+                f"Prov {prov_name}: threshold* = {thr:.3f} | Sens = {sens:.2f} | Spec = {spec:.2f} | AUROC = {auc:.3f}"
+            )
+            st.caption("*) Threshold dihitung dari OOF Cross-Validation (Youden’s index).")
+
 # ===== Forecast DAILY 7d → aggregate to weekly-like features =====
 st.subheader("2) Cuaca Harian 7 Hari ke Depan → Fitur Mingguan")
-
-# lat/lon source
 lat, lon, source = None, None, None
 if pd.notna(lat_override) and pd.notna(lon_override):
     try:
@@ -369,7 +465,7 @@ for c in wx_cols:
 feat_row = pd.concat([last_hist.reset_index(drop=True), df_future_wx.reset_index(drop=True)], axis=1)
 
 proba = predict_proba_with_model(model, feat_cols, feat_row)
-label = risk_label_from_score(proba)
+label = risk_label_with_prov_threshold(proba, prov_code)
 
 c1, c2 = st.columns(2)
 with c1:
@@ -377,7 +473,7 @@ with c1:
 with c2:
     st.markdown(risk_badge(label), unsafe_allow_html=True)
 
-st.caption("Threshold label: Low <0.33 ≤ Medium <0.66 ≤ High")
+st.caption("Jika threshold ROC per provinsi sudah dihitung (tombol di atas), label risiko mengikuti ambang tersebut. Fallback: Low <0.33 ≤ Medium <0.66 ≤ High")
 
 # ===== Link eksternal =====
 st.subheader("4) Lanjut ke Dashboard Screening")
@@ -385,6 +481,3 @@ st.markdown(
     "[🔗 Buka Dashboard Screening SIGER-DBD](https://skriningsigerdbd.streamlit.app/)",
     unsafe_allow_html=True
 )
-
-
-st.caption("Mode: Early-Fusion RF (insidensi + cuaca mingguan historis). Cuaca 7 hari **harian** diringkas ke format mingguan untuk inferensi.")
